@@ -1,0 +1,188 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in the project .env}
+      MYSQL_DATABASE: news_app
+      MYSQL_USER: ${NEWS_DB_USER:-news_app_user}
+      MYSQL_PASSWORD: ${NEWS_DB_PASSWORD:?Set NEWS_DB_PASSWORD in the project .env}
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./news-headline-backend/db/database.sql:/docker-entrypoint-initdb.d/01-database.sql:ro
+      - ./news-headline-backend/db/agent_schema.sql:/docker-entrypoint-initdb.d/02-agent-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Qdrant 保存新闻语义向量；MySQL 仍保存原文和业务状态。
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  backend:
+    build: ./news-headline-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: mysql+aiomysql://${NEWS_DB_USER:-news_app_user}:${NEWS_DB_PASSWORD:?Set NEWS_DB_PASSWORD in the project .env}@mysql:3306/news_app?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-50}
+      QDRANT_ENABLED: ${QDRANT_ENABLED:-false}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-news_evidence_v1}
+      EMBEDDING_API_BASE_URL: ${EMBEDDING_API_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1536}
+      EMBEDDING_VERSION: ${EMBEDDING_VERSION:-embedding-v1}
+      VECTOR_API_TIMEOUT_SECONDS: ${VECTOR_API_TIMEOUT_SECONDS:-30}
+      VECTOR_INDEX_BATCH_SIZE: ${VECTOR_INDEX_BATCH_SIZE:-50}
+      VECTOR_SEARCH_LIMIT: ${VECTOR_SEARCH_LIMIT:-50}
+      AI_API_KEY: ${AI_API_KEY:?Set AI_API_KEY in the project .env}
+      AI_API_BASE_URL: ${AI_API_BASE_URL:-https://api.deepseek.com}
+      AI_MODEL: ${AI_MODEL:-deepseek-flash}
+      AI_PROVIDER_NAME: ${AI_PROVIDER_NAME:-deepseek}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-45}
+      AI_MAX_RETRIES: ${AI_MAX_RETRIES:-2}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in the project .env}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      JWT_REFRESH_TOKEN_EXPIRE_DAYS: ${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-14}
+      JWT_REFRESH_COOKIE_NAME: ${JWT_REFRESH_COOKIE_NAME:-news_refresh_token}
+      JWT_COOKIE_SECURE: ${JWT_COOKIE_SECURE:-false}
+      JWT_COOKIE_SAMESITE: ${JWT_COOKIE_SAMESITE:-lax}
+      APP_ENV: ${APP_ENV:-local}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+      SQL_ECHO: ${SQL_ECHO:-false}
+      AGENT_RATE_LIMIT: ${AGENT_RATE_LIMIT:-10}
+      AGENT_RATE_WINDOW_SECONDS: ${AGENT_RATE_WINDOW_SECONDS:-60}
+      AGENT_LOCK_TTL_SECONDS: ${AGENT_LOCK_TTL_SECONDS:-240}
+      # Compose 由独立 Celery Worker/Beat 执行定时流水线，避免 API 扩容重复调度。
+      AUTO_PIPELINE_ENABLED: "false"
+      AUTO_PIPELINE_INTERVAL_SECONDS: ${AUTO_PIPELINE_INTERVAL_SECONDS:-60}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      HOST: 0.0.0.0
+      PORT: 8000
+    ports:
+      - "127.0.0.1:${API_PORT:-8001}:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Celery worker 消费 Beat 投递的任务；业务侧 Redis 锁保证重复任务安全。
+  worker:
+    build: ./news-headline-backend
+    restart: unless-stopped
+    command: ["celery", "-A", "celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    environment:
+      DATABASE_URL: mysql+aiomysql://${NEWS_DB_USER:-news_app_user}:${NEWS_DB_PASSWORD:?Set NEWS_DB_PASSWORD in the project .env}@mysql:3306/news_app?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_ENABLED: ${QDRANT_ENABLED:-false}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-news_evidence_v1}
+      EMBEDDING_API_BASE_URL: ${EMBEDDING_API_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1536}
+      EMBEDDING_VERSION: ${EMBEDDING_VERSION:-embedding-v1}
+      VECTOR_API_TIMEOUT_SECONDS: ${VECTOR_API_TIMEOUT_SECONDS:-30}
+      VECTOR_INDEX_BATCH_SIZE: ${VECTOR_INDEX_BATCH_SIZE:-50}
+      VECTOR_SEARCH_LIMIT: ${VECTOR_SEARCH_LIMIT:-50}
+      AI_API_KEY: ${AI_API_KEY:?Set AI_API_KEY in the project .env}
+      AI_API_BASE_URL: ${AI_API_BASE_URL:-https://api.deepseek.com}
+      AI_MODEL: ${AI_MODEL:-deepseek-flash}
+      AI_PROVIDER_NAME: ${AI_PROVIDER_NAME:-deepseek}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-45}
+      AI_MAX_RETRIES: ${AI_MAX_RETRIES:-2}
+      APP_ENV: ${APP_ENV:-local}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+      AUTO_PIPELINE_INTERVAL_SECONDS: ${AUTO_PIPELINE_INTERVAL_SECONDS:-60}
+      AUTO_PIPELINE_ENABLED: "false"
+    depends_on:
+      backend:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build: ./news-headline-backend
+    restart: unless-stopped
+    command: ["celery", "-A", "celery_app.celery_app", "beat", "--loglevel=INFO"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+      AUTO_PIPELINE_INTERVAL_SECONDS: ${AUTO_PIPELINE_INTERVAL_SECONDS:-60}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./news-headline-frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:${API_PORT:-8001}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-5173}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  redis_data:
+  qdrant_data:
+  prometheus_data:

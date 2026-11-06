@@ -1,0 +1,17 @@
+[
+  {
+    "name": "临时采集失败应进入重试",
+    "input": {"error_code": "fetch_timeout", "attempt_count": 1, "max_attempts": 3},
+    "expected": {"status": "retrying"}
+  },
+  {
+    "name": "达到最大次数后停止重试",
+    "input": {"error_code": "fetch_timeout", "attempt_count": 3, "max_attempts": 3},
+    "expected": {"status": "failed"}
+  },
+  {
+    "name": "永久错误直接失败",
+    "input": {"error_code": "invalid_feed", "attempt_count": 1, "max_attempts": 3},
+    "expected": {"status": "failed"}
+  }
+]
